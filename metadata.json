@@ -1,0 +1,11 @@
+{
+  "name": "ShreniKart Artisans — Shreni Setu",
+  "description": "AI-powered marketplace and smart cataloging assistant with Shreni Scan, studio background removal, Gemini craft analysis, offline draft persistence, and installable PWA for Indian artisans.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
