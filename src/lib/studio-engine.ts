@@ -92,86 +92,117 @@ export async function processStudioImage(
       alphaMask[i] = data[i * 4 + 3];
     }
   } else {
-    // Fallback client-side segmentation when offline or before API response
-    // Sample perimeter corner pixels to estimate background color profile
-    const samplePoints = [
-      { x: 4, y: 4 },
-      { x: w - 5, y: 4 },
-      { x: 4, y: h - 5 },
-      { x: w - 5, y: h - 5 },
-      { x: Math.floor(w / 2), y: 4 },
-      { x: 4, y: Math.floor(h / 2) },
-      { x: w - 5, y: Math.floor(h / 2) },
-    ];
+    // High-precision client-side background segmentation using border color profiling and connected floodfill
+    // 1. Gather perimeter pixels to build background color samples
+    const bgSamples: { r: number; g: number; b: number }[] = [];
+    const stepX = Math.max(1, Math.floor(w / 30));
+    const stepY = Math.max(1, Math.floor(h / 30));
 
-    let sumR = 0, sumG = 0, sumB = 0, count = 0;
-    for (const pt of samplePoints) {
-      const idx = (pt.y * w + pt.x) * 4;
-      sumR += data[idx];
-      sumG += data[idx + 1];
-      sumB += data[idx + 2];
-      count++;
+    // Sample top & bottom rows
+    for (let x = 0; x < w; x += stepX) {
+      const topIdx = x * 4;
+      const botIdx = ((h - 1) * w + x) * 4;
+      bgSamples.push({ r: data[topIdx], g: data[topIdx + 1], b: data[topIdx + 2] });
+      bgSamples.push({ r: data[botIdx], g: data[botIdx + 1], b: data[botIdx + 2] });
     }
-    const bgR = sumR / count;
-    const bgG = sumG / count;
-    const bgB = sumB / count;
+    // Sample left & right columns
+    for (let y = 0; y < h; y += stepY) {
+      const leftIdx = y * w * 4;
+      const rightIdx = (y * w + (w - 1)) * 4;
+      bgSamples.push({ r: data[leftIdx], g: data[leftIdx + 1], b: data[leftIdx + 2] });
+      bgSamples.push({ r: data[rightIdx], g: data[rightIdx + 1], b: data[rightIdx + 2] });
+    }
 
-    // Measure perimeter color variance to check background consistency
-    let variance = 0;
-    for (const pt of samplePoints) {
-      const idx = (pt.y * w + pt.x) * 4;
-      const diff = Math.sqrt(
-        (data[idx] - bgR) ** 2 +
-        (data[idx + 1] - bgG) ** 2 +
-        (data[idx + 2] - bgB) ** 2
+    // Compute mean background color
+    let sumR = 0, sumG = 0, sumB = 0;
+    for (const s of bgSamples) {
+      sumR += s.r;
+      sumG += s.g;
+      sumB += s.b;
+    }
+    const bgR = sumR / bgSamples.length;
+    const bgG = sumG / bgSamples.length;
+    const bgB = sumB / bgSamples.length;
+
+    // Background color distance function
+    const colorDist = (r: number, g: number, b: number) => {
+      // Perceptually weighted Euclidean distance (Red: 0.299, Green: 0.587, Blue: 0.114)
+      return Math.sqrt(
+        (r - bgR) ** 2 * 0.299 +
+        (g - bgG) ** 2 * 0.587 +
+        (b - bgB) ** 2 * 0.114
       );
-      variance += diff;
+    };
+
+    // Calculate background variance to adjust tolerance
+    let totalVar = 0;
+    for (const s of bgSamples) {
+      totalVar += colorDist(s.r, s.g, s.b);
     }
-    const avgBgVariance = variance / count;
+    const bgVariance = totalVar / bgSamples.length;
+    const tolerance = Math.max(30, Math.min(65, bgVariance * 2.2 + 25));
 
-    // Measure contrast between central craft region and perimeter
-    const centerIdx = (Math.floor(h / 2) * w + Math.floor(w / 2)) * 4;
-    const centerContrast = Math.sqrt(
-      (data[centerIdx] - bgR) ** 2 * 0.3 +
-      (data[centerIdx + 1] - bgG) ** 2 * 0.59 +
-      (data[centerIdx + 2] - bgB) ** 2 * 0.11
-    );
+    // 2. Breadth-first search (BFS) flood fill starting from all 4 borders
+    const isBackground = new Uint8Array(w * h);
+    const queue = new Int32Array(w * h);
+    let head = 0;
+    let tail = 0;
 
-    const isLowConfidence = centerContrast < 22 || avgBgVariance > 55;
-    const tolerance = isLowConfidence ? 28 : 42;
-
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const idx = (y * w + x) * 4;
-        const r = data[idx];
-        const g = data[idx + 1];
-        const b = data[idx + 2];
-
-        // Distance from estimated background color
-        const colorDist = Math.sqrt(
-          (r - bgR) ** 2 * 0.3 + (g - bgG) ** 2 * 0.59 + (b - bgB) ** 2 * 0.11
-        );
-
-        // Edge proximity boost (center of image is very likely foreground craft)
-        const distFromCenterNorm = Math.sqrt(
-          ((x - w / 2) / (w / 2)) ** 2 + ((y - h / 2) / (h / 2)) ** 2
-        );
-
-        let alpha = 255;
-        if (colorDist < tolerance) {
-          const factor = colorDist / tolerance;
-          alpha = Math.round(factor * 255);
-        } else {
-          alpha = 255;
-        }
-
-        const preserveThreshold = isLowConfidence ? 0.85 : 0.65;
-        if (distFromCenterNorm < preserveThreshold) {
-          alpha = Math.max(alpha, isLowConfidence ? 255 : 240);
-        }
-
-        alphaMask[y * w + x] = alpha;
+    // Seed borders into queue
+    for (let x = 0; x < w; x++) {
+      const top = x;
+      const bot = (h - 1) * w + x;
+      if (colorDist(data[top * 4], data[top * 4 + 1], data[top * 4 + 2]) < tolerance * 1.3) {
+        isBackground[top] = 1;
+        queue[tail++] = top;
       }
+      if (colorDist(data[bot * 4], data[bot * 4 + 1], data[bot * 4 + 2]) < tolerance * 1.3) {
+        isBackground[bot] = 1;
+        queue[tail++] = bot;
+      }
+    }
+    for (let y = 1; y < h - 1; y++) {
+      const left = y * w;
+      const right = y * w + (w - 1);
+      if (!isBackground[left] && colorDist(data[left * 4], data[left * 4 + 1], data[left * 4 + 2]) < tolerance * 1.3) {
+        isBackground[left] = 1;
+        queue[tail++] = left;
+      }
+      if (!isBackground[right] && colorDist(data[right * 4], data[right * 4 + 1], data[right * 4 + 2]) < tolerance * 1.3) {
+        isBackground[right] = 1;
+        queue[tail++] = right;
+      }
+    }
+
+    // Expand flood fill into background areas
+    while (head < tail) {
+      const curr = queue[head++];
+      const cx = curr % w;
+      const cy = Math.floor(curr / w);
+
+      // Check 4 neighbors
+      const neighbors = [
+        cx > 0 ? curr - 1 : -1,
+        cx < w - 1 ? curr + 1 : -1,
+        cy > 0 ? curr - w : -1,
+        cy < h - 1 ? curr + w : -1,
+      ];
+
+      for (const n of neighbors) {
+        if (n >= 0 && !isBackground[n]) {
+          const idx = n * 4;
+          const dist = colorDist(data[idx], data[idx + 1], data[idx + 2]);
+          if (dist < tolerance) {
+            isBackground[n] = 1;
+            queue[tail++] = n;
+          }
+        }
+      }
+    }
+
+    // 3. Populate alpha mask: background is 0 (transparent), foreground craft is 255 (opaque)
+    for (let i = 0; i < w * h; i++) {
+      alphaMask[i] = isBackground[i] ? 0 : 255;
     }
   }
 
@@ -306,4 +337,19 @@ export async function processStudioImage(
   }
 
   return outCanvas.toDataURL(options.backdrop === "transparent" ? "image/png" : "image/jpeg", 0.92);
+}
+
+/**
+ * Convenience helper that takes any image source and returns an isolated transparent PNG data URL.
+ */
+export async function segmentImageClientSide(imageSource: string | HTMLImageElement): Promise<string> {
+  return processStudioImage(imageSource, {
+    backdrop: "transparent",
+    brightness: 0,
+    contrast: 0,
+    warmth: 0,
+    edgeSoftness: 2,
+    shadow: false,
+    shadowIntensity: 0,
+  });
 }

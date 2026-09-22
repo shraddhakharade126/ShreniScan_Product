@@ -39,6 +39,7 @@ import { images, inr, type Product } from "@/lib/kalakart-data";
 import { cn } from "@/lib/utils";
 import {
   processStudioImage,
+  segmentImageClientSide,
   type BackdropType,
   type StudioOptions,
 } from "@/lib/studio-engine";
@@ -439,21 +440,33 @@ function AddProduct() {
             body: JSON.stringify({ imageBase64: rawImage }),
           });
 
-          if (!res.ok) {
-            const errJson = await res.json().catch(() => ({}));
-            throw new Error(errJson.error || `Server responded with ${res.status}`);
+          if (res.ok) {
+            const data = await res.json().catch(() => null);
+            if (data?.transparentPng && data.transparentPng !== rawImage && !data.clientSegmentation) {
+              if (!isCancelled) {
+                setTransparentCutout(data.transparentPng);
+                toast.success("Craft background isolated via AI studio!");
+                return;
+              }
+            }
           }
 
-          const data = await res.json();
-          if (!isCancelled && data.transparentPng) {
-            setTransparentCutout(data.transparentPng);
-            toast.success("Craft background isolated via dedicated AI provider!");
+          // If provider is in client segmentation fallback mode or status not ok
+          if (!isCancelled) {
+            const clientCutout = await segmentImageClientSide(rawImage);
+            setTransparentCutout(clientCutout);
+            toast.success("Craft background isolated cleanly!");
           }
         } catch (err: unknown) {
-          console.warn("Dedicated background removal notice, falling back to local canvas studio engine:", err);
-          // If offline or provider issue, fall back to rawImage with canvas segmentation so user is never blocked
+          console.warn("Dedicated background removal notice, applying local studio segmentation:", err);
           if (!isCancelled) {
-            setTransparentCutout(rawImage);
+            try {
+              const clientCutout = await segmentImageClientSide(rawImage);
+              setTransparentCutout(clientCutout);
+              toast.success("Craft background isolated cleanly!");
+            } catch {
+              setTransparentCutout(rawImage);
+            }
           }
         } finally {
           if (!isCancelled) {
